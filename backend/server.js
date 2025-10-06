@@ -3,6 +3,10 @@ const cors = require('cors');
 const helmet = require('helmet');
 const https = require('https');
 
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID;
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -16,20 +20,239 @@ const tracks = new Map();
 const shortUrls = new Map();
 
 // Helper function to make HTTP requests
-function makeRequest(url) {
+function makeRequest(url, options = {}) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          reject(e);
-        }
+    try {
+      const parsedUrl = new URL(url);
+      const requestOptions = {
+        method: options.method || 'GET',
+        headers: options.headers || {}
+      };
+
+      const req = https.request(parsedUrl, requestOptions, (res) => {
+        let data = '';
+
+        res.on('data', (chunk) => { data += chunk; });
+
+        res.on('end', () => {
+          let parsed;
+
+          try {
+            parsed = JSON.parse(data);
+          } catch (error) {
+            error.message = `Failed to parse response from ${url}: ${error.message}`;
+            return reject(error);
+          }
+
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const err = new Error(`Request to ${url} failed with status ${res.statusCode}`);
+            err.statusCode = res.statusCode;
+            err.body = parsed;
+            return reject(err);
+          }
+
+          resolve(parsed);
+        });
       });
-    }).on('error', reject);
+
+      req.on('error', reject);
+
+      if (options.body) {
+        const hasContentLengthHeader = Object.keys(requestOptions.headers)
+          .some((header) => header.toLowerCase() === 'content-length');
+        if (!hasContentLengthHeader) {
+          req.setHeader('Content-Length', Buffer.byteLength(options.body));
+        }
+        req.write(options.body);
+      }
+
+      req.end();
+    } catch (error) {
+      reject(error);
+    }
   });
+}
+
+function escapeHtml(value) {
+  if (!value) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+let spotifyTokenCache = {
+  token: null,
+  expiresAt: 0
+};
+
+async function getSpotifyAccessToken() {
+  if (!SPOTIFY_CLIENT_ID || !SPOTIFY_CLIENT_SECRET) {
+    return null;
+  }
+
+  const now = Date.now();
+  if (spotifyTokenCache.token && now < spotifyTokenCache.expiresAt) {
+    return spotifyTokenCache.token;
+  }
+
+  const credentials = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+
+  try {
+    const response = await makeRequest('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'grant_type=client_credentials'
+    });
+
+    if (response && response.access_token) {
+      spotifyTokenCache = {
+        token: response.access_token,
+        expiresAt: now + (response.expires_in - 60) * 1000
+      };
+      return spotifyTokenCache.token;
+    }
+  } catch (error) {
+    console.error('Failed to obtain Spotify access token:', error.message);
+  }
+
+  return null;
+}
+
+async function searchSpotifyTrack(title, artist) {
+  const query = [title, artist].filter(Boolean).join(' ').trim();
+  if (!query) {
+    return null;
+  }
+
+  const token = await getSpotifyAccessToken();
+  if (!token) {
+    return null;
+  }
+
+  const url = `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=1`;
+
+  try {
+    const data = await makeRequest(url, {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    if (data && data.tracks && data.tracks.items && data.tracks.items.length > 0) {
+      const track = data.tracks.items[0];
+      return {
+        id: track.id,
+        title: track.name,
+        artist: track.artists ? track.artists.map((item) => item.name).join(', ') : null,
+        artwork: track.album && track.album.images && track.album.images.length > 0
+          ? track.album.images[0].url
+          : null
+      };
+    }
+  } catch (error) {
+    if (error.statusCode === 401) {
+      spotifyTokenCache = { token: null, expiresAt: 0 };
+    }
+    console.error('Spotify search failed:', error.message);
+  }
+
+  return null;
+}
+
+async function lookupAppleTrack(id) {
+  if (!id) {
+    return null;
+  }
+
+  try {
+    const url = `https://itunes.apple.com/lookup?id=${id}`;
+    const response = await makeRequest(url);
+
+    if (response.results && response.results.length > 0) {
+      const track = response.results[0];
+      return {
+        title: track.trackName,
+        artist: track.artistName,
+        artwork: track.artworkUrl100 ? track.artworkUrl100.replace('100x100bb', '400x400bb') : null,
+        url: track.trackViewUrl
+      };
+    }
+  } catch (error) {
+    console.error('Apple Music lookup failed:', error.message);
+  }
+
+  return null;
+}
+
+async function searchAppleMusic(title, artist) {
+  const query = [title, artist].filter(Boolean).join(' ').trim();
+  if (!query) {
+    return null;
+  }
+
+  try {
+    const url = `https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=1`;
+    const response = await makeRequest(url);
+
+    if (response.results && response.results.length > 0) {
+      const track = response.results[0];
+      return {
+        title: track.trackName,
+        artist: track.artistName,
+        artwork: track.artworkUrl100 ? track.artworkUrl100.replace('100x100bb', '400x400bb') : null,
+        url: track.trackViewUrl
+      };
+    }
+  } catch (error) {
+    console.error('Apple Music search failed:', error.message);
+  }
+
+  return null;
+}
+
+async function searchYouTubeMusic(title, artist) {
+  if (!YOUTUBE_API_KEY) {
+    return null;
+  }
+
+  const query = [title, artist].filter(Boolean).join(' ').trim();
+  if (!query) {
+    return null;
+  }
+
+  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=1&q=${encodeURIComponent(query)}&key=${YOUTUBE_API_KEY}`;
+
+  try {
+    const response = await makeRequest(url);
+
+    if (response.items && response.items.length > 0) {
+      const item = response.items[0];
+      const videoId = item.id && item.id.videoId;
+
+      if (!videoId) {
+        return null;
+      }
+
+      const snippet = item.snippet || {};
+
+      return {
+        id: videoId,
+        title: snippet.title,
+        artwork: snippet.thumbnails && (snippet.thumbnails.high?.url || snippet.thumbnails.medium?.url || snippet.thumbnails.default?.url) || null,
+        url: `https://music.youtube.com/watch?v=${videoId}&feature=share`
+      };
+    }
+  } catch (error) {
+    console.error('YouTube Music search failed:', error.message);
+  }
+
+  return null;
 }
 
 // Helper function to extract track ID from URL
@@ -58,7 +281,8 @@ async function resolveTrackMetadata(trackInfo) {
     let title = 'Unknown Track';
     let artist = 'Unknown Artist';
     let artwork = null;
-    
+    const providerLinks = {};
+
     if (trackInfo.type === 'spotify') {
       // Use Spotify oEmbed API for metadata
       const oembedUrl = `https://open.spotify.com/oembed?url=https://open.spotify.com/track/${trackInfo.id}`;
@@ -70,6 +294,7 @@ async function resolveTrackMetadata(trackInfo) {
       } catch (e) {
         console.log('Spotify oEmbed failed, using fallback');
       }
+      providerLinks.spotify = `https://open.spotify.com/track/${trackInfo.id}`;
     } else if (trackInfo.type === 'youtube') {
       // Use YouTube oEmbed API
       const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${trackInfo.id}&format=json`;
@@ -81,30 +306,99 @@ async function resolveTrackMetadata(trackInfo) {
       } catch (e) {
         console.log('YouTube oEmbed failed, using fallback');
       }
+      providerLinks.youtube_music = `https://music.youtube.com/watch?v=${trackInfo.id}&feature=share`;
+    } else if (trackInfo.type === 'apple') {
+      const appleTrack = await lookupAppleTrack(trackInfo.id);
+      if (appleTrack) {
+        title = appleTrack.title || title;
+        artist = appleTrack.artist || artist;
+        artwork = appleTrack.artwork || artwork;
+        providerLinks.apple_music = appleTrack.url;
+      }
     }
-    
+
     // Generate provider links for all platforms
-    const providers = [
-      {
+    const query = [title, artist].filter(Boolean).join(' ').trim();
+
+    if (!providerLinks.spotify && query) {
+      const spotifyMatch = await searchSpotifyTrack(title, artist);
+      if (spotifyMatch) {
+        providerLinks.spotify = `https://open.spotify.com/track/${spotifyMatch.id}`;
+        if ((!artwork || artwork === null) && spotifyMatch.artwork) {
+          artwork = spotifyMatch.artwork;
+        }
+        if ((!title || title === 'Unknown Track') && spotifyMatch.title) {
+          title = spotifyMatch.title;
+        }
+        if ((!artist || artist === 'Unknown Artist') && spotifyMatch.artist) {
+          artist = spotifyMatch.artist;
+        }
+      }
+    }
+
+    if (!providerLinks.apple_music && query) {
+      const appleMatch = await searchAppleMusic(title, artist);
+      if (appleMatch) {
+        providerLinks.apple_music = appleMatch.url;
+        if ((!artwork || artwork === null) && appleMatch.artwork) {
+          artwork = appleMatch.artwork;
+        }
+        if ((!title || title === 'Unknown Track') && appleMatch.title) {
+          title = appleMatch.title;
+        }
+        if ((!artist || artist === 'Unknown Artist') && appleMatch.artist) {
+          artist = appleMatch.artist;
+        }
+      }
+    }
+
+    if (!providerLinks.youtube_music && query) {
+      const youtubeMatch = await searchYouTubeMusic(title, artist);
+      if (youtubeMatch) {
+        providerLinks.youtube_music = youtubeMatch.url;
+        if ((!artwork || artwork === null) && youtubeMatch.artwork) {
+          artwork = youtubeMatch.artwork;
+        }
+      }
+    }
+
+    const encodedQuery = query ? encodeURIComponent(query) : '';
+
+    const providers = [];
+
+    if (providerLinks.spotify || encodedQuery) {
+      const fallback = encodedQuery ? `https://open.spotify.com/search/${encodedQuery}` : null;
+      providers.push({
         name: 'spotify',
         displayName: 'Spotify',
-        deepLink: `https://open.spotify.com/track/${trackInfo.id}`,
-        isAvailable: true
-      },
-      {
+        deepLink: providerLinks.spotify || fallback,
+        isAvailable: Boolean(providerLinks.spotify),
+        fallbackLink: fallback
+      });
+    }
+
+    if (providerLinks.apple_music || encodedQuery) {
+      const fallback = encodedQuery ? `https://music.apple.com/search?term=${encodedQuery}` : null;
+      providers.push({
         name: 'apple_music',
         displayName: 'Apple Music',
-        deepLink: `https://music.apple.com/search?term=${encodeURIComponent(title + ' ' + artist)}`,
-        isAvailable: true
-      },
-      {
+        deepLink: providerLinks.apple_music || fallback,
+        isAvailable: Boolean(providerLinks.apple_music),
+        fallbackLink: fallback
+      });
+    }
+
+    if (providerLinks.youtube_music || encodedQuery) {
+      const fallback = encodedQuery ? `https://music.youtube.com/search?q=${encodedQuery}` : null;
+      providers.push({
         name: 'youtube_music',
         displayName: 'YouTube Music',
-        deepLink: `https://music.youtube.com/search?q=${encodeURIComponent(title + ' ' + artist)}`,
-        isAvailable: true
-      }
-    ];
-    
+        deepLink: providerLinks.youtube_music || fallback,
+        isAvailable: Boolean(providerLinks.youtube_music),
+        fallbackLink: fallback
+      });
+    }
+
     return {
       title,
       artist,
@@ -270,18 +564,39 @@ app.get('/t/:id', (req, res) => {
     `);
   }
   
+  const safeTitle = escapeHtml(track.title);
+  const safeArtist = escapeHtml(track.artist);
+  const safeArtwork = track.artwork ? escapeHtml(track.artwork) : '';
+
+  const providerButtons = (track.providers || [])
+    .filter((provider) => provider.deepLink)
+    .map((provider) => {
+      const safeLink = escapeHtml(provider.deepLink);
+      const safeName = escapeHtml(provider.displayName);
+      const label = provider.isAvailable ? 'Play on' : 'Search on';
+      const classes = `provider-btn ${provider.name}${provider.isAvailable ? '' : ' unavailable'}`;
+      const targetAttrs = provider.isAvailable ? '' : ' target="_blank" rel="noopener noreferrer"';
+      return `
+            <a href="${safeLink}" class="${classes}"${targetAttrs}>
+              ${label} ${safeName}
+            </a>`;
+    })
+    .join('');
+
+  const providerContent = providerButtons || '<p class="empty-state">We could not find direct links for this track yet.</p>';
+
   res.send(`
     <!DOCTYPE html>
     <html>
     <head>
-      <title>${track.title} - ${track.artist} | TrackShare</title>
+      <title>${safeTitle} - ${safeArtist} | TrackShare</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <meta property="og:title" content="${track.title} - ${track.artist}">
-      <meta property="og:description" content="Listen to ${track.title} by ${track.artist} on your preferred music platform">
-      <meta property="og:image" content="${track.artwork || ''}">
+      <meta property="og:title" content="${safeTitle} - ${safeArtist}">
+      <meta property="og:description" content="Listen to ${safeTitle} by ${safeArtist} on your preferred music platform">
+      <meta property="og:image" content="${safeArtwork}">
       <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
+        body {
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
           background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
           min-height: 100vh;
@@ -342,12 +657,20 @@ app.get('/t/:id', (req, res) => {
           background: #f8f9ff;
           transform: translateY(-2px);
         }
+        .provider-btn.unavailable {
+          border-style: dashed;
+          opacity: 0.8;
+        }
         .spotify { border-color: #1db954; }
         .spotify:hover { background: #f0fff4; }
         .apple { border-color: #fa243c; }
         .apple:hover { background: #fff0f0; }
         .youtube { border-color: #ff0000; }
         .youtube:hover { background: #fff0f0; }
+        .empty-state {
+          color: #555;
+          font-size: 15px;
+        }
         .footer {
           margin-top: 30px;
           font-size: 14px;
@@ -358,19 +681,15 @@ app.get('/t/:id', (req, res) => {
     <body>
       <div class="container">
         <div class="artwork">
-          ${track.artwork ? `<img src="${track.artwork}" alt="Track artwork">` : '🎵'}
+          ${safeArtwork ? `<img src="${safeArtwork}" alt="Track artwork">` : '🎵'}
         </div>
-        <h1>${track.title}</h1>
-        <div class="artist">${track.artist}</div>
-        
+        <h1>${safeTitle}</h1>
+        <div class="artist">${safeArtist}</div>
+
         <div class="providers">
-          ${track.providers.map(provider => `
-            <a href="${provider.deepLink}" class="provider-btn ${provider.name}">
-              Play on ${provider.displayName}
-            </a>
-          `).join('')}
+          ${providerContent}
         </div>
-        
+
         <div class="footer">
           Powered by TrackShare
         </div>
